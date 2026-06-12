@@ -1,0 +1,37 @@
+{
+  "wms": {
+    "base_url": "https://example-wms.local",
+    "target_page": "https://example-wms.local/wms/outbound/parcel",
+    "username": "",
+    "password": ""
+  },
+  "download": {
+    "start_time": "",
+    "end_time": "",
+    "wh_codes": "US02",
+    "statuses": "15",
+    "channel": "",
+    "workers": 5,
+    "limit": 0,
+    "browser_mode": false,
+    "force": false,
+    "validate_pdf": true,
+    "expected_formats": "4x6"
+  },
+  "recognition": {
+    "dpi": 200,
+    "timeout": 30,
+    "max_pages": 1
+  },
+  "paths": {
+    "pdf_download_dir": "pdf_downloads",
+    "log_dir": "logs",
+    "download_log": "logs/download_log.csv",
+    "output_dir": "output/pdf",
+    "output_name": "pdf_label_pipeline_result",
+    "storage_state": "wms_storage_state.json"
+  },
+  "browser": {
+    "headless": false
+  }
+}

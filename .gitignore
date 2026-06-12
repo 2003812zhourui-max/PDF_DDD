@@ -1,0 +1,77 @@
+# Python virtual environments and cache
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Build outputs
+dist/
+dist*/
+build/
+build*/
+*.spec
+*.spec~
+
+# Runtime logs and outputs
+logs/
+*.log
+output/
+downloads/
+pdf_downloads/
+temp/
+tmp/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+config.json
+storage_state.json
+wms_storage_state.json
+*.storage_state.json
+.wms_token_cache.json
+*cookie*
+*token*
+*password*
+*passwd*
+*credential*
+*secret*
+*账号*
+*密码*
+
+# Browser cache and local browser profiles
+.playwright/
+ms-playwright/
+browser_cache/
+.browser_cache/
+chrome-user-data/
+user-data-dir/
+User Data/
+Default/
+
+# Temporary Excel and Office output
+~$*.xlsx
+~$*.xls
+*.tmp.xlsx
+*.temp.xlsx
+*_tmp.xlsx
+*_temp.xlsx
+*_output.xlsx
+*_result.xlsx
+
+# Local generated data and archives
+*.jsonl
+*.csv
+*.zip
+6-8/
+20*/
+
+# Local archives and experiments
+_unrelated_files/
+WMS_PDF_Tool/
+WMS_PDF_Tool_core/
+.codex_deps/
+PDF_DDD_clean*/
+PDF_DDD_upload*/

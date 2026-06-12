@@ -1,0 +1,13 @@
+# Runtime
+PyMuPDF
+Pillow
+curl_cffi
+openpyxl
+playwright
+pypdf
+pytesseract
+requests
+zxing-cpp
+
+# Packaging
+pyinstaller
