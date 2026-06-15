@@ -77,6 +77,11 @@ CSV_FIELDS = [
     "expressNo",
     "customerCode",
     "whCode",
+    "logisticsCarrier",
+    "logisticsChannel",
+    "logisticsChannelName",
+    "channelGroupCode",
+    "channelGroupName",
     "status",
     "filePath",
     "error",
@@ -1054,6 +1059,17 @@ def load_success_delivery_nos() -> set[str]:
 def append_log(row: dict[str, Any]) -> None:
     LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
     file_exists = LOG_FILE.exists()
+    if file_exists:
+        with LOG_FILE.open("r", encoding="utf-8-sig", newline="") as file:
+            reader = csv.DictReader(file)
+            existing_fields = list(reader.fieldnames or [])
+            if any(field not in existing_fields for field in CSV_FIELDS):
+                rows = list(reader)
+                with LOG_FILE.open("w", encoding="utf-8-sig", newline="") as output:
+                    writer = csv.DictWriter(output, fieldnames=CSV_FIELDS)
+                    writer.writeheader()
+                    for item in rows:
+                        writer.writerow({field: item.get(field, "") for field in CSV_FIELDS})
     with LOG_FILE.open("a", encoding="utf-8-sig", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=CSV_FIELDS)
         if not file_exists:
@@ -1504,44 +1520,105 @@ def make_pdf_path(order: dict[str, str], label_count: int, label_index: int) -> 
     return PDF_DIR / filename
 
 
-def download_pdf_with_requests(url: str, path: Path, session=None) -> None:
+CONTENT_TYPE_SUFFIXES = {
+    "application/pdf": ".pdf",
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/webp": ".webp",
+    "image/tiff": ".tif",
+    "image/tif": ".tif",
+}
+
+
+def suffix_from_download(content_type: str, sample: bytes) -> str:
+    head = sample[:16]
+    if head.startswith(b"%PDF-"):
+        return ".pdf"
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if head.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if head.startswith(b"RIFF") and sample[8:12] == b"WEBP":
+        return ".webp"
+    if head.startswith((b"II*\x00", b"MM\x00*")):
+        return ".tif"
+    mime = content_type.split(";", 1)[0].strip().lower()
+    return CONTENT_TYPE_SUFFIXES.get(mime, "")
+
+
+def path_for_download_type(path: Path, suffix: str) -> Path:
+    if not suffix or path.suffix.lower() == suffix:
+        return path
+    return path.with_suffix(suffix)
+
+
+def reject_non_label_download(content_type: str, sample: bytes) -> None:
+    mime = content_type.split(";", 1)[0].strip().lower()
+    if mime in {"text/html", "text/plain", "application/json"}:
+        preview = sample[:200].decode("utf-8", errors="replace").replace("\r", " ").replace("\n", " ")
+        raise RuntimeError(f"download result is not PDF/image: content-type={content_type or '-'} preview={preview}")
+
+
+def download_pdf_with_requests(url: str, path: Path, session=None) -> Path:
     if requests is None:
         raise RuntimeError("当前 Python 环境未安装 requests")
 
     client = session or requests
     with client.get(url, timeout=60, stream=True) as response:
         response.raise_for_status()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("wb") as file:
-            for chunk in response.iter_content(chunk_size=1024 * 256):
+        content_type = str(response.headers.get("content-type") or response.headers.get("Content-Type") or "")
+        chunks = response.iter_content(chunk_size=1024 * 256)
+        first_chunk = b""
+        for chunk in chunks:
+            if chunk:
+                first_chunk = bytes(chunk)
+                break
+        if not first_chunk:
+            raise RuntimeError("requests download returned an empty file")
+
+        reject_non_label_download(content_type, first_chunk)
+        actual_path = path_for_download_type(path, suffix_from_download(content_type, first_chunk))
+        actual_path.parent.mkdir(parents=True, exist_ok=True)
+        with actual_path.open("wb") as file:
+            file.write(first_chunk)
+            for chunk in chunks:
                 if chunk:
-                    file.write(chunk)
+                    file.write(bytes(chunk))
 
-    if path.stat().st_size == 0:
-        raise RuntimeError("requests 下载结果为空文件")
+    if actual_path.stat().st_size == 0:
+        raise RuntimeError("requests download returned an empty file")
+    return actual_path
 
 
-def download_pdf_with_playwright(context, url: str, path: Path) -> None:
+def download_pdf_with_playwright(context, url: str, path: Path) -> Path:
     response = context.request.get(url, timeout=60000)
     if not response.ok:
         raise RuntimeError(f"Playwright 下载失败：HTTP {response.status} {response.status_text}")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(response.body())
-    if path.stat().st_size == 0:
-        raise RuntimeError("Playwright 下载结果为空文件")
+    body = response.body()
+    content_type = str(response.headers.get("content-type") or response.headers.get("Content-Type") or "")
+    if not body:
+        raise RuntimeError("Playwright download returned an empty file")
+    reject_non_label_download(content_type, body)
+    actual_path = path_for_download_type(path, suffix_from_download(content_type, body))
+    actual_path.parent.mkdir(parents=True, exist_ok=True)
+    actual_path.write_bytes(body)
+    if actual_path.stat().st_size == 0:
+        raise RuntimeError("Playwright download returned an empty file")
+    return actual_path
 
 
-def download_pdf(context, url: str, path: Path) -> None:
+def download_pdf(context, url: str, path: Path) -> Path:
     try:
-        download_pdf_with_requests(url, path)
+        return download_pdf_with_requests(url, path)
     except Exception as requests_error:
         log(f"requests 下载失败，改用 Playwright 下载：{requests_error}")
-        download_pdf_with_playwright(context, url, path)
+        return download_pdf_with_playwright(context, url, path)
 
 
-def download_pdf_http(session, url: str, path: Path) -> None:
+def download_pdf_http(session, url: str, path: Path) -> Path:
     try:
-        download_pdf_with_requests(url, path, session=session)
+        return download_pdf_with_requests(url, path, session=session)
     except Exception as exc:
         raise RuntimeError(f"requests 下载 PDF 失败：{exc}") from exc
 
@@ -1553,6 +1630,11 @@ def normalize_order(record: dict[str, Any]) -> dict[str, str]:
         "customerCode": first_non_empty(record, "customerCode"),
         "whCode": first_non_empty(record, "whCode"),
         "expressNo": first_non_empty(record, "expressNo"),
+        "logisticsCarrier": first_non_empty(record, "logisticsCarrier"),
+        "logisticsChannel": first_non_empty(record, "logisticsChannel"),
+        "logisticsChannelName": first_non_empty(record, "logisticsChannelName"),
+        "channelGroupCode": first_non_empty(record, "channelGroupCode"),
+        "channelGroupName": first_non_empty(record, "channelGroupName"),
     }
 
 
@@ -1810,7 +1892,7 @@ def download_order_records(
 
 def process_order_with_client(
     fetch_json: Callable[..., dict[str, Any]],
-    download_file: Callable[[str, Path], None],
+    download_file: Callable[[str, Path], Path | None],
     order: dict[str, str],
     extra_headers: dict[str, str],
 ) -> list[Path]:
@@ -1825,6 +1907,11 @@ def process_order_with_client(
         "customerCode": first_non_empty(detail_data, "customerCode") or order["customerCode"],
         "whCode": first_non_empty(detail_data, "whCode") or order["whCode"],
         "expressNo": first_non_empty(detail_data, "expressNo") or order["expressNo"],
+        "logisticsCarrier": first_non_empty(detail_data, "logisticsCarrier"),
+        "logisticsChannel": first_non_empty(detail_data, "logisticsChannel"),
+        "logisticsChannelName": first_non_empty(detail_data, "logisticsChannelName"),
+        "channelGroupCode": first_non_empty(detail_data, "channelGroupCode"),
+        "channelGroupName": first_non_empty(detail_data, "channelGroupName"),
     }
 
     labels = extract_label_files(detail_data)
@@ -1848,12 +1935,12 @@ def process_order_with_client(
 
         pdf_path = make_pdf_path(detail_order, len(labels), index)
         log(f"开始下载 PDF：{pdf_path.name}")
-        download_file(down_load_url, pdf_path)
+        saved_path = download_file(down_load_url, pdf_path) or pdf_path
         try:
-            append_label_metadata(pdf_path, detail_order, detail_data, label, url_json, down_load_url)
+            append_label_metadata(saved_path, detail_order, detail_data, label, url_json, down_load_url)
         except Exception as exc:
             log(f"结构化面单信息写入失败，继续原下载流程：{exc}")
-        saved_paths.append(pdf_path)
+        saved_paths.append(saved_path)
 
     return saved_paths
 
@@ -1862,8 +1949,8 @@ def process_order(page: Page, context, order: dict[str, str], extra_headers: dic
     def fetch_json(url: str, method: str = "GET", extra_headers: dict[str, str] | None = None, **kwargs):
         return fetch_json_in_page(page, url, method=method, extra_headers=extra_headers, **kwargs)
 
-    def download_file(url: str, path: Path) -> None:
-        download_pdf(context, url, path)
+    def download_file(url: str, path: Path) -> Path:
+        return download_pdf(context, url, path)
 
     return process_order_with_client(fetch_json, download_file, order, extra_headers)
 
@@ -1884,8 +1971,8 @@ def process_order_http(
             **kwargs,
         )
 
-    def download_file(url: str, path: Path) -> None:
-        download_pdf_http(session, url, path)
+    def download_file(url: str, path: Path) -> Path:
+        return download_pdf_http(session, url, path)
 
     return process_order_with_client(fetch_json, download_file, order, extra_headers)
 

@@ -51,6 +51,8 @@ from batch_download_wms_pdfs import (
     fetch_json_http_with_auth_retry as _fetch_json,
     fetch_json_http as _fetch_json_direct,
     download_pdf_http as _download_pdf,
+    append_label_metadata as _append_label_metadata,
+    finalize_label_metadata_outputs as _finalize_label_metadata_outputs,
 )
 
 # ============================
@@ -70,7 +72,8 @@ AUTH_STATE_FILE = DEFAULT_STORAGE_STATE
 
 CSV_FIELDS = [
     "deliveryNo", "sourceNo", "expressNo", "customerCode",
-    "whCode", "status", "filePath", "error", "downloadedAt",
+    "whCode", "logisticsCarrier", "logisticsChannel", "logisticsChannelName",
+    "channelGroupCode", "channelGroupName", "status", "filePath", "error", "downloadedAt",
 ]
 
 
@@ -301,7 +304,7 @@ def extract_label_files(detail: dict[str, Any]) -> list[dict[str, str]]:
     fk = first_non_empty(detail, "fileKey")
     fn = first_non_empty(detail, "fileName")
     if fk:
-        labels.append({"fileKey": fk, "fileName": fn})
+        labels.append({"fileKey": fk, "fileName": fn, "raw_item": {}})
         return labels
     pkg_list = detail.get("packageList")
     if not isinstance(pkg_list, list):
@@ -315,7 +318,7 @@ def extract_label_files(detail: dict[str, Any]) -> list[dict[str, str]]:
         if not fk or (fk, fn) in seen:
             continue
         seen.add((fk, fn))
-        labels.append({"fileKey": fk, "fileName": fn})
+        labels.append({"fileKey": fk, "fileName": fn, "raw_item": pkg})
     return labels
 
 
@@ -326,6 +329,11 @@ def normalize_order(record: dict[str, Any]) -> dict[str, str]:
         "customerCode": first_non_empty(record, "customerCode"),
         "whCode": first_non_empty(record, "whCode"),
         "expressNo": first_non_empty(record, "expressNo"),
+        "logisticsCarrier": first_non_empty(record, "logisticsCarrier"),
+        "logisticsChannel": first_non_empty(record, "logisticsChannel"),
+        "logisticsChannelName": first_non_empty(record, "logisticsChannelName"),
+        "channelGroupCode": first_non_empty(record, "channelGroupCode"),
+        "channelGroupName": first_non_empty(record, "channelGroupName"),
     }
 
 
@@ -354,6 +362,17 @@ def append_log(row: dict[str, Any]) -> None:
     LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
     with _csv_lock:
         exists = LOG_FILE.exists()
+        if exists:
+            with LOG_FILE.open("r", encoding="utf-8-sig", newline="") as f:
+                reader = csv.DictReader(f)
+                existing_fields = list(reader.fieldnames or [])
+                if any(field not in existing_fields for field in CSV_FIELDS):
+                    rows = list(reader)
+                    with LOG_FILE.open("w", encoding="utf-8-sig", newline="") as output:
+                        writer = csv.DictWriter(output, fieldnames=CSV_FIELDS)
+                        writer.writeheader()
+                        for item in rows:
+                            writer.writerow({field: item.get(field, "") for field in CSV_FIELDS})
         with LOG_FILE.open("a", encoding="utf-8-sig", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
             if not exists:
@@ -439,8 +458,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--end-time", default=DEFAULT_END_TIME)
     p.add_argument("--status", default=DEFAULT_STATUSES)
     p.add_argument("--size", type=int, default=100)
-    p.add_argument("--max-pages", type=int, default=10)
-    p.add_argument("--limit", type=int, default=DEFAULT_LIMIT or 1000)
+    p.add_argument("--max-pages", type=int, default=200)
+    p.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
     p.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
     p.add_argument("--pdf-dir", default=str(PDF_DIR))
     p.add_argument("--log-file", default=str(LOG_FILE))
@@ -465,6 +484,11 @@ def process_one(session, auth_values, order: dict[str, str]) -> list[Path]:
         "customerCode": first_non_empty(detail, "customerCode") or order["customerCode"],
         "whCode": first_non_empty(detail, "whCode") or order["whCode"],
         "expressNo": first_non_empty(detail, "expressNo") or order["expressNo"],
+        "logisticsCarrier": first_non_empty(detail, "logisticsCarrier") or order.get("logisticsCarrier", ""),
+        "logisticsChannel": first_non_empty(detail, "logisticsChannel") or order.get("logisticsChannel", ""),
+        "logisticsChannelName": first_non_empty(detail, "logisticsChannelName") or order.get("logisticsChannelName", ""),
+        "channelGroupCode": first_non_empty(detail, "channelGroupCode") or order.get("channelGroupCode", ""),
+        "channelGroupName": first_non_empty(detail, "channelGroupName") or order.get("channelGroupName", ""),
     }
 
     labels = extract_label_files(detail)
@@ -480,8 +504,12 @@ def process_one(session, auth_values, order: dict[str, str]) -> list[Path]:
         if not dl_url:
             raise RuntimeError("下载链接接口没有返回 downLoadUrl")
         pdf_path = make_pdf_path(d_order, len(labels), idx)
-        _download_pdf(session, dl_url, pdf_path)
-        saved.append(pdf_path)
+        saved_path = _download_pdf(session, dl_url, pdf_path) or pdf_path
+        try:
+            _append_label_metadata(saved_path, d_order, detail, label, url_json, dl_url)
+        except Exception as exc:
+            log(f"metadata 写入失败，继续下载流程: {exc}")
+        saved.append(saved_path)
     return saved
 
 
@@ -589,7 +617,8 @@ def main() -> None:
                     "weightCountStart": "", "whCode": wh_code, "withVas": "",
                 }
                 data = _fetch_json(session, auth_values, LIST_API, method="POST", payload=payload)
-                records = data.get("data", {}).get("records", []) if isinstance(data.get("data"), dict) else []
+                data_body = data.get("data", {}) if isinstance(data.get("data"), dict) else {}
+                records = data_body.get("records", [])
                 if not records:
                     break
                 for r in records:
@@ -616,7 +645,8 @@ def main() -> None:
         log("没有需要下载的订单")
         return
 
-    filtered = filtered[:args.limit]
+    if args.limit and args.limit > 0:
+        filtered = filtered[:args.limit]
     _counter["total"] = len(filtered)
     _counter["done"] = 0
 
@@ -677,6 +707,7 @@ def main() -> None:
                 progress_log(dno, "[FAIL]", r.get("error", "")[:60])
 
     elapsed = time.time() - t0
+    _finalize_label_metadata_outputs()
     log(f"完成 ({elapsed:.1f}s) ok={stats['ok']} fail={stats['fail']} skip={stats['skip']} refresh={stats['refresh']}")
     log(f"PDF: {PDF_DIR.resolve()}")
     log(f"Log: {LOG_FILE.resolve()}")

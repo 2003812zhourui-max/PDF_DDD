@@ -154,8 +154,6 @@ class VerifyResult:
     meta_channel_code: str = ""
     meta_customer_code: str = ""
     meta_source: str = ""
-    meta_carrier_conflict: bool = False
-    meta_carrier_note: str = ""
 
 
 TRACKING_PATTERNS: dict[str, re.Pattern[str]] = {
@@ -174,7 +172,7 @@ TRACKING_PATTERNS: dict[str, re.Pattern[str]] = {
 TEMPLATE_RULES: list[tuple[str, str, re.Pattern[str]]] = [
     ("CBT", "CBT", re.compile(r"\b(?:TT[-\s]?CBT|CBT\s*[AB]\s*\d{2})\b", re.I)),
     ("CBS", "CBS", re.compile(r"\b(?:LAX[-\s]?CBS|CBS)\b", re.I)),
-    ("0024", "0024", re.compile(r"\b0024(?:\s*0?[12])?\b", re.I)),
+    ("0024", "0024", re.compile(r"\b(?:0024(?:\s*0?2)?|LAX)\b", re.I)),
     ("天翼", "天翼", re.compile(r"天翼", re.I)),
     ("官方", "官方", re.compile(r"官方", re.I)),
     ("达通", "达通", re.compile(r"达通", re.I)),
@@ -295,6 +293,13 @@ def match_template_text(text: str, source: str, confidence: str) -> TemplateMatc
             template_confidence=confidence,
         )
 
+    if re.search(r"\bLAX\b", spaced, re.I):
+        return TemplateMatch(
+            template_code="0024",
+            template_marker="0024",
+            template_source=source,
+            template_confidence=confidence,
+        )
     return TemplateMatch()
 
 
@@ -304,7 +309,7 @@ def match_template_corner_text(text: str, source: str, confidence: str) -> Templ
         return match
 
     _spaced, compact = normalize_template_text(text)
-    if re.search(r"[AB]0[1-5]", compact):
+    if re.search(r"[AB](?:0[1-5]|1[1-5])", compact):
         return TemplateMatch(
             template_code="CBT",
             template_sub_code=NORMAL_LABEL_SUBDIVISION,
@@ -404,6 +409,99 @@ def template_ocr_regions(image: Image.Image) -> list[tuple[str, Image.Image]]:
     ]
 
 
+def quick_template_ocr_regions(image: Image.Image) -> list[tuple[str, Image.Image]]:
+    width, height = image.size
+    return [
+        ("template_top_left_ocr", image.crop((0, 0, int(width * 0.55), int(height * 0.22)))),
+        ("template_lower_left_ocr", image.crop((0, int(height * 0.60), int(width * 0.55), height))),
+        ("template_middle_ocr", image.crop((int(width * 0.20), int(height * 0.08), width, int(height * 0.48)))),
+    ]
+
+
+def has_fedex_cbt_marker_block(image: Image.Image) -> bool:
+    gray = ImageOps.grayscale(image)
+    width, height = gray.size
+    max_y = int(height * 0.40)
+    step = 3
+    pixels = gray.load()
+    seen: set[tuple[int, int]] = set()
+    for start_y in range(0, max_y, step):
+        for start_x in range(0, width, step):
+            point = (start_x, start_y)
+            if point in seen or pixels[start_x, start_y] > 50:
+                continue
+            stack = [point]
+            seen.add(point)
+            xs: list[int] = []
+            ys: list[int] = []
+            while stack:
+                x, y = stack.pop()
+                xs.append(x)
+                ys.append(y)
+                for next_x, next_y in ((x + step, y), (x - step, y), (x, y + step), (x, y - step)):
+                    next_point = (next_x, next_y)
+                    if (
+                        0 <= next_x < width
+                        and 0 <= next_y < max_y
+                        and next_point not in seen
+                        and pixels[next_x, next_y] <= 50
+                    ):
+                        seen.add(next_point)
+                        stack.append(next_point)
+            if len(xs) < 250:
+                continue
+            x1, x2 = min(xs) / width, max(xs) / width
+            y1, y2 = min(ys) / height, max(ys) / height
+            box_width = x2 - x1
+            box_height = y2 - y1
+            if 0.48 <= x1 <= 0.62 and 0.14 <= y1 <= 0.24 and 0.12 <= box_width <= 0.28 and 0.08 <= box_height <= 0.16:
+                return True
+    return False
+
+
+def has_top_0024_marker_block(image: Image.Image) -> bool:
+    gray = ImageOps.grayscale(image)
+    width, height = gray.size
+    max_x = int(width * 0.62)
+    max_y = int(height * 0.22)
+    step = 3
+    pixels = gray.load()
+    seen: set[tuple[int, int]] = set()
+    marker_boxes = 0
+    for start_y in range(0, max_y, step):
+        for start_x in range(0, max_x, step):
+            point = (start_x, start_y)
+            if point in seen or pixels[start_x, start_y] > 60:
+                continue
+            stack = [point]
+            seen.add(point)
+            xs: list[int] = []
+            ys: list[int] = []
+            while stack:
+                x, y = stack.pop()
+                xs.append(x)
+                ys.append(y)
+                for next_x, next_y in ((x + step, y), (x - step, y), (x, y + step), (x, y - step)):
+                    next_point = (next_x, next_y)
+                    if (
+                        0 <= next_x < max_x
+                        and 0 <= next_y < max_y
+                        and next_point not in seen
+                        and pixels[next_x, next_y] <= 60
+                    ):
+                        seen.add(next_point)
+                        stack.append(next_point)
+            if len(xs) < 250:
+                continue
+            x1, x2 = min(xs) / width, max(xs) / width
+            y1, y2 = min(ys) / height, max(ys) / height
+            box_width = x2 - x1
+            box_height = y2 - y1
+            if 0.04 <= y1 <= 0.08 and 0.07 <= box_height <= 0.11 and 0.06 <= box_width <= 0.11 and 0.06 <= x1 <= 0.50:
+                marker_boxes += 1
+    return marker_boxes >= 4
+
+
 def first_page_images_for_template(path: Path, dpi: int, is_image_label: bool) -> tuple[list[Image.Image], str]:
     if is_image_label:
         images, _page_count, error = load_image_file(path)
@@ -433,9 +531,33 @@ def detect_template(
     images, image_error = first_page_images_for_template(path, dpi=dpi, is_image_label=is_image_label)
     if not image_error and images and load_ocr_engine() is not None:
         for image in images:
+            for region_name, crop in quick_template_ocr_regions(image):
+                match = match_template_corner_text(ocr_image(crop), region_name, "medium")
+                if match.template_code:
+                    return match
+        for image in images:
             match = match_template_corner_text(ocr_template_corner(image), "左下模板OCR", "中")
             if match.template_code:
                 return match
+
+    if not image_error and images:
+        for image in images:
+            if has_top_0024_marker_block(image):
+                return TemplateMatch(
+                    template_code="0024",
+                    template_sub_code="",
+                    template_marker="0024",
+                    template_source="top_0024_marker_block",
+                    template_confidence="medium",
+                )
+            if has_fedex_cbt_marker_block(image):
+                return TemplateMatch(
+                    template_code="CBT",
+                    template_sub_code=NORMAL_LABEL_SUBDIVISION,
+                    template_marker="CBT",
+                    template_source="fedex_cbt_marker_block",
+                    template_confidence="medium",
+                )
 
     if not ocr_enabled:
         return TemplateMatch()
@@ -580,33 +702,6 @@ def infer_carrier(value: str) -> str:
     if re.fullmatch(r"\d{12}|\d{15}|\d{20}|\d{22}", tracking):
         return "FedEx"
     return "UNKNOWN"
-
-
-def normalize_carrier_name(value: str) -> str:
-    text = normalize(value)
-    if not text or text in {"UNKNOWN", "OTHER"}:
-        return ""
-    aliases = {
-        "USPS": "USPS",
-        "POSTAL": "USPS",
-        "FEDEX": "FedEx",
-        "FDX": "FedEx",
-        "UPS": "UPS",
-        "GOFO": "GOFO",
-        "GFUS": "GOFO",
-        "SWIFTX": "SwiftX",
-        "SWX": "SwiftX",
-        "UNIUNI": "UniUni",
-        "UUS": "UniUni",
-        "LASERSHIP": "LaserShip",
-        "1LS": "LaserShip",
-        "SPEEDX": "SpeedX",
-        "SPX": "SpeedX",
-        "YANWEN": "Yanwen",
-        "YW": "Yanwen",
-        "ONTRAC": "OnTrac",
-    }
-    return aliases.get(text, value.strip())
 
 
 def load_zxingcpp() -> Any | None:
@@ -1016,7 +1111,7 @@ def determine_status(
         if source_tracking
         and carrier == "USPS"
         and value.startswith(source_tracking)
-        and 0 < len(value) - len(source_tracking) <= 4
+        and 0 < len(value) - len(source_tracking) <= 5
     ]
     if prefix_text and source_tracking and (not barcode_values or source_tracking in barcode_values):
         return "auto_pass_verified_prefix", "high", "USPS text layer has glued digits, prefix matched source tracking", False
@@ -1115,8 +1210,6 @@ def error_result(row: dict[str, Any], wms_records: dict[str, str], exc: Exceptio
         meta_channel_code=str(row.get("meta_channel_code") or ""),
         meta_customer_code=str(row.get("meta_customer_code") or ""),
         meta_source=str(row.get("meta_source") or ""),
-        meta_carrier_conflict=False,
-        meta_carrier_note="",
     )
 
 
@@ -1137,7 +1230,8 @@ def process_row(row: dict[str, Any], args: argparse.Namespace, zxingcpp: Any | N
     meta_channel_code = str(row.get("meta_channel_code") or "")
     meta_customer_code = str(row.get("meta_customer_code") or "")
     meta_source = str(row.get("meta_source") or "")
-    carrier = infer_carrier(source_tracking)
+    # 优先用 metadata 的 carrier，其次从追踪号推断
+    carrier = meta_carrier if meta_carrier else infer_carrier(source_tracking)
     reason_parts: list[str] = []
     file_error = ""
 
@@ -1260,21 +1354,6 @@ def process_row(row: dict[str, Any], args: argparse.Namespace, zxingcpp: Any | N
     )
     if last_mile_carrier == "UNKNOWN":
         last_mile_carrier = carrier
-    if carrier == "UNKNOWN" and last_mile_carrier != "UNKNOWN":
-        carrier = last_mile_carrier
-
-    final_carrier_for_compare = last_mile_carrier if last_mile_carrier != "UNKNOWN" else carrier
-    normalized_meta_carrier = normalize_carrier_name(meta_carrier)
-    meta_carrier_conflict = bool(
-        normalized_meta_carrier
-        and final_carrier_for_compare != "UNKNOWN"
-        and normalized_meta_carrier != final_carrier_for_compare
-    )
-    meta_carrier_note = ""
-    if meta_carrier_conflict:
-        meta_carrier_note = f"metadata={normalized_meta_carrier}; tracking={final_carrier_for_compare}"
-    elif normalized_meta_carrier:
-        meta_carrier_note = f"metadata={normalized_meta_carrier}"
 
     allow_full_page_template_ocr = verify_status not in TRACKING_STATUS_STRONG
     template_match = TemplateMatch()
@@ -1374,8 +1453,6 @@ def process_row(row: dict[str, Any], args: argparse.Namespace, zxingcpp: Any | N
         meta_channel_code=meta_channel_code,
         meta_customer_code=meta_customer_code,
         meta_source=meta_source,
-        meta_carrier_conflict=meta_carrier_conflict,
-        meta_carrier_note=meta_carrier_note,
     )
 
 
